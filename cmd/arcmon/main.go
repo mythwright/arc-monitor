@@ -96,27 +96,22 @@ func (s *Server) Tick(ctx context.Context) {
 				logrus.Errorf("Failed getting checksum: (%v)", err)
 				continue
 			}
-			version, err := s.GetVersion(ctx)
-			if err != nil {
-				logrus.Errorf("Failed getting version: (%v)", err)
-				continue
-			}
 			if s.arcdps.CheckSum == "" {
 				logrus.Infof("Setting initial version")
-				s.arcdps.CheckSum = check
-				s.arcdps.Timestamp = version
+				s.arcdps.CheckSum = check.Checksum
+				s.arcdps.Timestamp = check.LastModified
 				continue
 			}
-			if s.arcdps.CheckSum != check {
+			if s.arcdps.CheckSum != check.Checksum {
 				// new version
 				if err := s.SendWebHook(ctx,
-					fmt.Sprintf("`%s`", check),
-					fmt.Sprintf("`%s`", version.String()),
+					fmt.Sprintf("`%s`", check.Checksum),
+					fmt.Sprintf("`%s`", check.LastModified.String()),
 				); err != nil {
 					logrus.Errorf("unable to send webhook: (%v)\n", err)
 				}
-				s.arcdps.CheckSum = check
-				s.arcdps.Timestamp = version
+				s.arcdps.CheckSum = check.Checksum
+				s.arcdps.Timestamp = check.LastModified
 			}
 		case <-ctx.Done():
 			ticker.Stop()
@@ -125,60 +120,44 @@ func (s *Server) Tick(ctx context.Context) {
 	}
 }
 
-func (s *Server) GetChecksum(ctx context.Context) (string, error) {
+// Checksum : Used to compare local cache to remote
+type Checksum struct {
+	Checksum     string
+	LastModified time.Time
+}
+
+func (s *Server) GetChecksum(ctx context.Context) (*Checksum, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", ArcDPSCheckSumURL, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if resp.StatusCode > 299 {
-		return "", fmt.Errorf("bad response from delta: (%s)", string(body))
+		return nil, fmt.Errorf("bad response from delta: (%s)", string(body))
+	}
+
+	lastModified, err := time.Parse(time.RFC1123, resp.Header.Get("Last-Modified"))
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse time: (%v)", err)
 	}
 
 	checkSumSplit := strings.Split(string(body), " ")
 	if len(checkSumSplit) < 2 {
-		return "", fmt.Errorf("incorrect size of checksum split")
-	}
-	return checkSumSplit[0], nil
-
-}
-
-func (s *Server) GetVersion(ctx context.Context) (time.Time, error) {
-	req, err := http.NewRequestWithContext(ctx, "HEAD", ArcDPSDLLURL, nil)
-	if err != nil {
-		return time.Time{}, err
+		return nil, fmt.Errorf("incorrect size of checksum split")
 	}
 
-	resp, err := s.http.Do(req)
-	if err != nil {
-		return time.Time{}, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode > 299 {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return time.Time{}, err
-		}
-		return time.Time{}, fmt.Errorf("bad response from delta: (%s)", string(body))
-	}
-	lastModified, err := time.Parse(time.RFC1123, resp.Header.Get("Last-Modified"))
-	if err != nil {
-		return time.Time{}, fmt.Errorf("unable to parse time: (%v)", err)
-	}
-
-	return lastModified, nil
+	return &Checksum{Checksum: checkSumSplit[0], LastModified: lastModified}, nil
 }
 
 func (s *Server) SendWebHook(ctx context.Context, checksum, time string) error {
